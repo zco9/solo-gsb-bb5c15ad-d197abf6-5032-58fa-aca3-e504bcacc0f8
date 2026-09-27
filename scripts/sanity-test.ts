@@ -7,6 +7,12 @@ import { planMerge, joinBilingualText } from '../src/lib/merge';
 import { planExcerpt, rewriteTimestampTags } from '../src/lib/excerpt';
 import { suggestWrap, planSmartWrap, visibleWidth } from '../src/lib/wrap';
 import { applyTerminology, planTerminology } from '../src/lib/term';
+import {
+  parseSpeakerTable,
+  planSpeakerMigration,
+  inspectVoice,
+  applyVoiceTag,
+} from '../src/lib/speaker';
 import { detectIssues } from '../src/lib/issues';
 import {
   parseCueSettings,
@@ -1190,6 +1196,191 @@ cid-61
   assert.ok(!re.error, re.error);
   assert.strictEqual(re.cues[0].text, 'AI<b></b>真好用');
   ok('术语统一：应用后导出保留标识符/设置/时间码/文件头，正文写入且可往返');
+}
+
+// ---------- 说话人标注迁移 ----------
+
+function scue(id: string, s: number, e: number, text: string, locked = false): Cue {
+  return { id, identifier: '', start: s, end: e, text, settings: '', locked };
+}
+
+// 63. 说话人表解析：Tab / 逗号分隔、表头跳过、无效行计数
+{
+  const t = parseSpeakerTable('起点\t终点\t角色名\n00:00.000\t00:02.000\t张三\n00:02.000,00:05.000,李四');
+  assert.strictEqual(t.segs.length, 2);
+  assert.strictEqual(t.badLines, 0);
+  assert.strictEqual(t.segs[0].name, '张三');
+  assert.deepStrictEqual([t.segs[0].start, t.segs[0].end], [0, 2]);
+  assert.strictEqual(t.segs[1].name, '李四');
+
+  // 无分隔符的行按空白切分，第 3 列起拼回（允许带空格的名字）
+  const t2 = parseSpeakerTable('00:00.000 00:02.000 Alice Smith\n');
+  assert.strictEqual(t2.segs[0].name, 'Alice Smith');
+
+  // 时间码无效 / 终点不晚于起点 / 角色名为空 / 名字含尖括号 => 无效行
+  const t3 = parseSpeakerTable('00:00.000\t00:02.000\t\n09:00\t00:02.000\t甲\n00:03.000\t00:03.000\t乙\n00:01.000\t00:02.000\t<丙>');
+  assert.strictEqual(t3.segs.length, 0);
+  assert.strictEqual(t3.badLines, 4);
+  ok('说话人表：Tab/逗号/空白切分、表头跳过、无效行计数');
+}
+
+// 64. 按重叠总时长选最长角色；无重叠跳过；同分歧义；同名区间时长合并
+{
+  const cs: Cue[] = [
+    scue('a', 0, 4, '第一'),           // 甲 [0,3] 3s + 甲 [3,5] 1s = 4s（同名合并）
+    scue('b', 5, 6, '第二'),           // 与 [3,5]、[6,8] 均仅端点接触，与任何区间无正时长交集
+    scue('c', 6, 10, '第三'),          // 乙 [6,8] 2s vs 丙 [8,10] 2s => 歧义
+  ];
+  const table = parseSpeakerTable(
+    '00:00.000\t00:03.000\t甲\n00:03.000\t00:05.000\t甲\n00:06.000\t00:08.000\t乙\n00:08.000\t00:10.000\t丙',
+  );
+  const plan = planSpeakerMigration(cs, table.segs);
+  assert.strictEqual(plan.entries.length, 3);
+  assert.strictEqual(plan.entries[0].status, 'unique');
+  assert.strictEqual(plan.entries[0].chosen, '甲');
+  assert.strictEqual(plan.entries[0].candidates[0].overlapMs, 4000);
+
+  assert.strictEqual(plan.entries[1].status, 'none');
+  assert.ok(plan.entries[1].reason!.includes('无时间重叠'));
+
+  assert.strictEqual(plan.entries[2].status, 'ambiguous');
+  assert.strictEqual(plan.entries[2].chosen, null);
+  assert.ok(plan.entries[2].reason!.includes('并列'));
+  assert.deepStrictEqual(plan.entries[2].candidates.map((c) => c.name), ['丙', '乙']); // 同分时名字升序
+  ok('说话人规划：最长重叠取胜、同名合并、无重叠跳过、同分歧义');
+}
+
+// 65. 仅端点接触不计重叠；部分相交按时长计；候选按时长降序
+{
+  const cs: Cue[] = [
+    scue('a', 0, 2, 'A'),  // 与 seg [2,4] 仅端点接触；与 seg [1,5] 交 1s
+  ];
+  const table = parseSpeakerTable('00:02.000\t00:04.000\t甲\n00:01.000\t00:05.000\t乙');
+  const plan = planSpeakerMigration(cs, table.segs);
+  assert.strictEqual(plan.entries[0].status, 'unique');
+  assert.strictEqual(plan.entries[0].chosen, '乙');
+  assert.strictEqual(plan.entries[0].candidates.length, 1);
+  ok('说话人规划：端点接触不算重叠');
+}
+
+// 66. 锁定片段跳过并给出原因
+{
+  const cs: Cue[] = [scue('L', 0, 2, '锁定', true)];
+  const table = parseSpeakerTable('00:00.000\t00:02.000\t甲');
+  const plan = planSpeakerMigration(cs, table.segs);
+  assert.strictEqual(plan.entries[0].status, 'locked');
+  assert.ok(plan.entries[0].reason!.includes('锁定'));
+  assert.strictEqual(plan.entries[0].chosen, null);
+  ok('说话人规划：锁定片段跳过');
+}
+
+// 67. 正文说话人标签结构识别：数量、角色名、是否包住整个正文
+{
+  assert.deepStrictEqual(
+    { ...inspectVoice('<v 张三>你好</v>'), },
+    { count: 1, names: ['张三'], enclosing: true },
+  );
+  // 前导/尾随空白不影响“包住整个正文”的判定
+  assert.strictEqual(inspectVoice('<v 张三>你好</v>\n').enclosing, true);
+  assert.strictEqual(inspectVoice(' <v 张三>你好</v>').enclosing, true);
+  // 多个说话人片段
+  const m = inspectVoice('<v 甲>谁</v><v 乙>我</v>');
+  assert.strictEqual(m.count, 2);
+  assert.deepStrictEqual(m.names, ['甲', '乙']);
+  assert.strictEqual(m.enclosing, false);
+  // 唯一标签只包住部分正文 => 不算 enclosing
+  assert.strictEqual(inspectVoice('前缀<v 甲>话</v>').enclosing, false);
+  // 类名保留；时间戳/其它内联标签不被误计
+  assert.deepStrictEqual(inspectVoice('<00:01.000><b>x</b>'), { count: 0, names: [], enclosing: false });
+  const cls = inspectVoice('<v.guest.lead 李四>话</v>');
+  assert.strictEqual(cls.count, 1);
+  assert.deepStrictEqual(cls.names, ['李四']);
+  ok('说话人标签：结构识别（数量/名字/全包判定/类名）');
+}
+
+// 68. 无标签 => 整个正文外包一层，正文逐字符保留（内联标签/时间戳/换行不动）
+{
+  const text = '<00:01.000><b>你好</b>\n第二行';
+  const out = applyVoiceTag(text, '张三');
+  assert.strictEqual(out, '<v 张三><00:01.000><b>你好</b>\n第二行</v>');
+  // 唯一标签只包部分正文 => 整段外包（不拆原标签）
+  const out2 = applyVoiceTag('前缀<v 甲>话</v>', '乙');
+  assert.strictEqual(out2, '<v 乙>前缀<v 甲>话</v></v>');
+  ok('说话人写入：无/半包标签时整个正文外包且原文逐字符保留');
+}
+
+// 69. 全包标签 => 仅更新开标签角色名，类名保留，其余内容（含闭标签位置）不动
+{
+  assert.strictEqual(applyVoiceTag('<v 张三>你好</v>', '李四'), '<v 李四>你好</v>');
+  assert.strictEqual(
+    applyVoiceTag('<v.guest 张三>你好\n第二行</v>', '李四'),
+    '<v.guest 李四>你好\n第二行</v>',
+  );
+  // 未命名/大写 <v> 更新为具名标签（大小写不敏感识别；闭标签原文保留）
+  assert.strictEqual(applyVoiceTag('<V Zhang>hi</V>', '李四'), '<v 李四>hi</V>');
+  assert.strictEqual(applyVoiceTag('<v>你好</v>', '张三'), '<v 张三>你好</v>');
+  // 同名 => 文本不变（面板据此不重复写入）
+  assert.strictEqual(applyVoiceTag('<v 张三>你好</v>', '张三'), '<v 张三>你好</v>');
+  ok('说话人写入：全包标签只更新角色名（保留类名与全部原文）');
+}
+
+// 70. 正文已有多个说话人片段 => 规划跳过且 applyVoiceTag 拒绝自动覆盖
+{
+  const text = '<v 甲>谁</v><v 乙>我</v>';
+  const cs: Cue[] = [scue('a', 0, 4, text)];
+  const table = parseSpeakerTable('00:00.000\t00:04.000\t丙');
+  const plan = planSpeakerMigration(cs, table.segs);
+  assert.strictEqual(plan.entries[0].status, 'multi');
+  assert.ok(plan.entries[0].reason!.includes('个说话人片段'));
+  assert.strictEqual(applyVoiceTag(text, '丙'), null);
+  ok('说话人迁移：多说话人片段不自动覆盖');
+}
+
+// 71. 确认写入 + 导出往返：只改正文，时间码/标识符/设置/文件头保留，结果可往返
+{
+  const v = `WEBVTT
+
+NOTE 保留头
+
+cid-70
+00:01.000 --> 00:04.000 line:90% align:middle
+<00:01.500>你好<b>世界</b>
+`;
+  const p = parseVTT(v);
+  assert.ok(!p.error, p.error);
+  const table = parseSpeakerTable('00:01.000\t00:04.000\t张三');
+  const plan = planSpeakerMigration(p.cues, table.segs);
+  assert.strictEqual(plan.entries.length, 1);
+  const e = plan.entries[0];
+  assert.strictEqual(e.status, 'unique');
+  const next = applyVoiceTag(e.original, e.chosen!)!;
+  const applied = p.cues.map((c) => (c.id === e.id ? { ...c, text: next } : c));
+  const out = serializeVTT(applied, p.preamble);
+  assert.ok(out.includes('NOTE 保留头'));
+  assert.ok(out.includes('cid-70'));
+  assert.ok(out.includes('00:01.000 --> 00:04.000 line:90% align:middle'));
+  assert.ok(out.includes('<v 张三><00:01.500>你好<b>世界</b></v>'), out);
+  const re = parseVTT(out);
+  assert.ok(!re.error, re.error);
+  assert.strictEqual(re.cues[0].start, 1);
+  assert.strictEqual(re.cues[0].end, 4);
+  assert.strictEqual(re.cues[0].identifier, 'cid-70');
+  assert.strictEqual(re.cues[0].settings, 'line:90% align:middle');
+  // 二次迁移（更新已有全包标签）只换角色名，时间戳标签与 <b> 保持位置
+  const plan2 = planSpeakerMigration(re.cues, parseSpeakerTable('00:01.000\t00:04.000\t李四').segs);
+  const next2 = applyVoiceTag(plan2.entries[0].original, '李四')!;
+  assert.strictEqual(next2, '<v 李四><00:01.500>你好<b>世界</b></v>');
+  ok('说话人迁移：应用+导出往返，更新时仅换角色名');
+}
+
+// 72. 规划不修改输入
+{
+  const cs: Cue[] = [scue('a', 0, 4, '<v 甲>谁</v><v 乙>我</v>'), scue('L', 4, 6, '锁', true)];
+  const snapshot = JSON.parse(JSON.stringify(cs));
+  const table = parseSpeakerTable('00:00.000\t00:06.000\t丙');
+  planSpeakerMigration(cs, table.segs);
+  assert.deepStrictEqual(cs, snapshot);
+  ok('说话人规划：输入不被修改');
 }
 
 console.log(`\n全部 ${passed} 组测试通过 ✅`);

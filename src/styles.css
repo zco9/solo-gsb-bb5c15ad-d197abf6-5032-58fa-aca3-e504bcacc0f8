@@ -597,6 +597,40 @@ button.mini.danger:hover { color: var(--error); border-color: var(--error); }
 }
 .term-rule-hits { color: var(--muted); font-size: 10.5px; }
 
+/* ---------- Speaker tag migration ---------- */
+.speaker-list { max-height: 320px; overflow-y: auto; }
+.speaker-row { cursor: default; }
+.speaker-row .merge-head { cursor: pointer; }
+.speaker-row.ambiguous { border-left: 3px solid var(--warn); }
+.speaker-row.excluded { opacity: .65; border-left: 3px solid var(--border); }
+.speaker-badge {
+  font-size: 10.5px;
+  border-radius: 4px;
+  padding: 0 5px;
+}
+.speaker-badge.ok {
+  color: var(--ok);
+  background: rgba(63, 207, 142, .12);
+}
+.speaker-badge.warn {
+  color: var(--warn);
+  background: rgba(255, 182, 72, .14);
+}
+.speaker-badge.muted {
+  color: var(--muted);
+  background: var(--panel-2);
+}
+.speaker-orig-name { color: var(--muted); font-size: 10.5px; }
+.speaker-controls {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 5px;
+}
+.speaker-select { flex: 1 1 auto; width: auto; cursor: pointer; }
+.speaker-same { margin-top: 3px; }
+.wrap-reason.muted { color: var(--muted); }
+
 /* ---------- Inspector ---------- */
 .inspector .row { margin-bottom: 10px; }
 .chk { display: flex; align-items: center; gap: 8px; font-size: 13px; cursor: pointer; }
